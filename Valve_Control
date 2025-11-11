@@ -1,0 +1,40 @@
+# valve_control.py
+import RPi.GPIO as GPIO
+import time
+
+# GPIO pin (BCM)
+VALVE_PIN = 6
+
+def setup():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(VALVE_PIN, GPIO.OUT, initial=GPIO.LOW)  # LOW = valve closed if MOSFET off
+
+def open_valve():
+    # set GPIO HIGH -> MOSFET gate driven -> valve energized -> valve opens
+    GPIO.output(VALVE_PIN, GPIO.HIGH)
+
+def close_valve():
+    GPIO.output(VALVE_PIN, GPIO.LOW)
+
+def toggle_valve(duration=2.0):
+    open_valve()
+    time.sleep(duration)
+    close_valve()
+
+def cleanup():
+    GPIO.output(VALVE_PIN, GPIO.LOW)
+    GPIO.cleanup()
+
+if __name__ == "__main__":
+    try:
+        setup()
+        print("Opening valve for 5 seconds...")
+        open_valve()
+        time.sleep(1000)
+        print("Closing valve.")
+        close_valve()
+    except KeyboardInterrupt:
+        print("Interrupted")
+    finally:
+        cleanup()
+        print("Cleaned up and exiting.")
