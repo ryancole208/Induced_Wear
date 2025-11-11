@@ -1,0 +1,221 @@
+import RPi.GPIO as GPIO
+import time
+import board
+from adafruit_ht16k33.segments import Seg14x4  # Correct library
+
+# --------------------
+# Rotary Encoder Setup
+# --------------------
+CLK = 17  # Pin 11
+DT = 25   # Pin 22
+SW = 27   # Pin 13
+
+CLK2 = 22 # Pin 15
+DT2 = 23 # Pin 16
+SW2 = 24 # Pin 18
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+GPIO.setup(CLK2, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(DT2, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(SW2, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+# --------------------
+# Display Setup
+# --------------------
+i2c = board.I2C()
+display = Seg14x4(i2c)
+display.fill(1)
+display.brightness = 1.0
+
+
+
+
+# --------------------
+# Button Setup
+# --------------------
+
+
+stop = 26
+go = 16
+GPIO.setup(stop, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(go, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+
+# --------------------
+# Valve Set Up
+# --------------------
+VALVE_PIN = 6
+#GPIO.setmode(GPIO.BCM)
+#GPIO.setup(VALVE_PIN, GPIO.OUT, initial=GPIO.LOW)
+
+# --------------------
+# Global Variables
+# --------------------
+rotary_counter = 0
+clk_last_state = GPIO.input(CLK)
+
+rotary_counter2 = 0
+clk_last_state2 = GPIO.input(CLK2)
+#start_time = time.monotonic()
+last_display_update = 0  # Track last display update
+button_state = 0
+global_state = 0
+elapsed = 0
+stop_state = 0
+go_state = 0
+# --------------------
+# Functions
+# --------------------
+def handle_rotary_encoder():
+    """Poll the rotary encoder and update rotary_counter."""
+    global clk_last_state, rotary_counter
+
+    clk_state = GPIO.input(CLK)
+    dt_state = GPIO.input(DT)
+
+    if clk_state != clk_last_state:
+        if dt_state != clk_state:
+            rotary_counter += 1
+        else:
+            rotary_counter -= 1
+
+            
+        if rotary_counter == 40 or rotary_counter == -40:
+            rotary_counter = 0
+        print(f"Rotary Counter: {rotary_counter}")
+
+    clk_last_state = clk_state
+
+
+
+    # if GPIO.input(SW) == 0:
+    #     print("Button pressed!")
+    #     start_time = time.monotonic()
+    #     global_state = 1
+    #     while GPIO.input(SW) == 0:
+    #         time.sleep(0.01)  # Wait for release
+
+def handle_rotary_encoder2():
+    """Poll the rotary encoder and update rotary_counter."""
+    global clk_last_state2, rotary_counter2
+
+    clk_state2 = GPIO.input(CLK2)
+    dt_state2 = GPIO.input(DT2)
+
+    if clk_state2 != clk_last_state2:
+        if dt_state2 != clk_state2:
+            rotary_counter2 += 1
+        else:
+            rotary_counter2 -= 1
+
+            
+        if rotary_counter2 == 40 or rotary_counter2 == -40:
+            rotary_counter2 = 0
+        print(f"Rotary Counter2: {rotary_counter2}")
+
+    clk_last_state2 = clk_state2
+
+
+
+
+def update_timer_display():
+    """Update the timer display showing elapsed minutes and seconds."""
+    global elapsed
+
+    elapsed = int(time.monotonic() - start_time)
+    minutes = elapsed // 60
+    seconds = elapsed % 60
+    display.print(f"{minutes:02d}{seconds:02d}")
+    display.colon = True
+
+def update_cycle_display():
+    display_cycles.print(f"{valve_cycles:04d}")
+
+
+
+
+
+def stop_press():
+    global stop_state
+    "Pressing the Big Red Button"
+    stop_state = GPIO.input(stop)
+
+        #print('Stop', stop_state)
+        #print('Go', go_state)
+
+def go_press():
+    "Pressing the Big Green Button"
+    global go_state, global_state, start_time
+    go_state = GPIO.input(go)
+    if go_state == 0:
+        print('Starting Timer')
+        start_time = time.monotonic()
+        global_state = 1
+
+def open_valve():
+    # set GPIO HIGH -> MOSFET gate driven -> valve energized -> valve opens
+    GPIO.output(VALVE_PIN, GPIO.HIGH)
+def close_valve():
+    GPIO.output(VALVE_PIN, GPIO.LOW)
+
+
+
+# --------------------
+# Main Loop
+# --------------------
+try:
+    print("Rotary encoders running. Rotate and press button to set timer.")
+    while True:
+        # Poll rotary encoder fast (1 ms)
+        stop_press()
+        if stop_state == 0:
+            #GPIO.output(VALVE_PIN, GPIO.LOW)
+            display.fill(1)
+            #GPIO.cleanup()
+            print("Program terminated.")
+            global_state = 0
+            time.sleep(.5)
+            print("Rotary encoder runnings. Rotate and press button to set timer.")
+
+        if global_state == 0:
+            go_press()
+            handle_rotary_encoder()
+            handle_rotary_encoder2()
+            #button_press()
+        # Update display every 1 second
+        if global_state == 1:
+            elapsed = 0
+            current_time = time.monotonic()
+            if current_time - last_display_update >= 1.0:
+                update_timer_display()
+                last_display_update = current_time
+
+
+
+            if rotary_counter <= -10:
+                if elapsed == 120:
+                    global_state = 0
+                    print("Rotary encoder running. Rotate and press button to set timer.")
+                    display.fill(1)
+            elif rotary_counter > -10 and rotary_counter < 10:
+                if elapsed == 60:
+                    global_state = 0
+                    print("Rotary encoder running. Rotate or press button to set timer.")
+                    display.fill(1)
+            elif rotary_counter >= 10:
+                if elapsed == 10:
+                    global_state = 0
+                    print("Rotary encoder running. Rotate or press button to set timer.")
+                    display.fill(1)
+            
+
+        time.sleep(0.001)  # small sleep for CPU relief
+except KeyboardInterrupt:
+    display.fill(0)
+    #GPIO.output(VALVE_PIN, GPIO.LOW)
+    GPIO.cleanup()
+    print("Program terminated.")
