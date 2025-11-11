@@ -1,0 +1,55 @@
+import RPi.GPIO as GPIO
+import time
+
+# Pin configuration
+IN1 = 12  # Connect to IN1 on L298N
+IN2 = 13  # Connect to IN2 on L298N
+ENA = 16  # Connect to ENA on L298N (PWM speed control)
+
+# GPIO setup
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(IN1, GPIO.OUT)
+GPIO.setup(IN2, GPIO.OUT)
+GPIO.setup(ENA, GPIO.OUT)
+
+# Set up PWM on ENA at 1000Hz
+pwm = GPIO.PWM(ENA, 1000)
+pwm.start(0)  # Motor initially stopped
+
+def spin_motor(direction, speed=80, duration=2):
+    """
+    Spins the motor in a given direction at a certain speed for a set duration.
+    direction: 'forward' or 'backward'
+    speed: 0-100 (percentage of max speed)
+    duration: seconds
+    """
+    if direction == 'forward':
+        GPIO.output(IN1, GPIO.HIGH)
+        GPIO.output(IN2, GPIO.LOW)
+    elif direction == 'backward':
+        GPIO.output(IN1, GPIO.LOW)
+        GPIO.output(IN2, GPIO.HIGH)
+    else:
+        GPIO.output(IN1, GPIO.LOW)
+        GPIO.output(IN2, GPIO.LOW)
+    
+    pwm.ChangeDutyCycle(speed)
+    time.sleep(duration)
+    
+    # Stop the motor
+    GPIO.output(IN1, GPIO.LOW)
+    GPIO.output(IN2, GPIO.LOW)
+    pwm.ChangeDutyCycle(0)
+
+try:
+    print("Spinning forward")
+    spin_motor('forward', speed=40, duration=1)
+    
+    time.sleep(1)  # Short pause
+
+    print("Spinning backward")
+    spin_motor('backward', speed=70, duration=2)
+
+finally:
+    pwm.stop()
+    GPIO.cleanup()
