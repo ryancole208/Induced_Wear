@@ -1,0 +1,23 @@
+import RPi.GPIO as GPIO
+import time
+
+#Pins
+stop = 26
+go = 16
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(stop, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(go, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+try:
+    while True:
+        stop_state = GPIO.input(stop)
+        go_state = GPIO.input(go)
+
+        print('Stop', stop_state)
+        print('Go', go_state)
+
+        time.sleep(0.01)
+except KeyboardInterrupt:
+    GPIO.cleanup()
+    print("Program terminated.")
