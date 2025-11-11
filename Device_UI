@@ -1,0 +1,237 @@
+import tkinter as tk
+from tkinter import ttk
+import RPi.GPIO as GPIO
+import time
+import threading
+
+# --- Constants ---
+LED_PIN = 26
+STATE_SETUP = "setup"
+STATE_RUNNING = "running"
+STATE_PAUSED = "paused"
+SCALE = 1.2  # enlarge UI elements ~20%
+
+# --- GPIO setup ---
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(LED_PIN, GPIO.OUT)
+GPIO.output(LED_PIN, GPIO.LOW)
+
+class DeviceUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Device UI")
+        self.root.geometry("800x480+0+0")
+        self.root.configure(bg="white")
+
+        # --- State variables ---
+        self.total_time = 1
+        self.cycle_rate = 1
+        self.elapsed = 0
+        self.cycle_count = 0
+        self.state = STATE_SETUP
+
+        self._run_flag = threading.Event()
+        self._pause_flag = threading.Event()
+        self._run_thread = None
+
+        self._build_ui()
+        self._update_ui_from_values()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_ui(self):
+        # --- Layout Frames ---
+        top_frame = tk.Frame(self.root, bg="white")
+        top_frame.pack(side="top", fill="x", pady=int(10 * SCALE))
+
+        bottom_frame = tk.Frame(self.root, bg="white")
+        bottom_frame.pack(side="bottom", fill="both", expand=True, padx=int(20 * SCALE), pady=int(5 * SCALE))
+
+        left_frame = tk.Frame(bottom_frame, bg="white")
+        left_frame.pack(side="left", fill="y", padx=int(10 * SCALE))
+
+        right_frame = tk.Frame(bottom_frame, bg="white")
+        right_frame.pack(side="right", fill="y", padx=int(10 * SCALE))
+
+        # --- Timer and Counter Display ---
+        tk.Label(top_frame, text="Timer (mm:ss):", bg="white", fg="black", font=("Arial", int(18 * SCALE), "bold")).grid(row=0, column=0, sticky="w", padx=int(20 * SCALE))
+        self.time_display = tk.Label(top_frame, text="00:00", bg="white", fg="black", font=("Arial", int(24 * SCALE)))
+        self.time_display.grid(row=0, column=1, sticky="w")
+
+        tk.Label(top_frame, text="Cycles:", bg="white", fg="black", font=("Arial", int(18 * SCALE), "bold")).grid(row=1, column=0, sticky="w", padx=int(20 * SCALE))
+        self.count_display = tk.Label(top_frame, text="0", bg="white", fg="black", font=("Arial", int(24 * SCALE)))
+        self.count_display.grid(row=1, column=1, sticky="w")
+
+        self.state_label = tk.Label(top_frame, text="State: SETUP", bg="white", fg="gray", font=("Arial", int(14 * SCALE)))
+        self.state_label.grid(row=2, column=0, sticky="w", padx=int(20 * SCALE), pady=(5, 0))
+
+        # --- Sliders (Left Frame) ---
+        tk.Label(left_frame, text="Timer Duration (seconds)", bg="white", fg="black", font=("Arial", int(14 * SCALE))).pack()
+        self.timer_scale = ttk.Scale(left_frame, from_=1, to=120, orient="horizontal", length=int(300 * SCALE), command=self._on_timer_scale)
+        self.timer_scale.set(1)
+        self.timer_scale.pack(pady=int(10 * SCALE))
+
+        # Moved tick display slightly up
+        self.timer_ticks = tk.Canvas(left_frame, width=int(300 * SCALE), height=int(35 * SCALE), bg="white", highlightthickness=0)
+        self.timer_ticks.pack(pady=(0, int(5 * SCALE)))
+        self._draw_ticks(self.timer_ticks, 120, 10, int(300 * SCALE), timer=True)
+
+        self.timer_value_label = tk.Label(left_frame, text="Timer 00:01", bg="white", fg="black", font=("Arial", int(12 * SCALE)))
+        self.timer_value_label.pack(pady=(0, int(10 * SCALE)))
+
+        tk.Label(left_frame, text="Cycle Interval (seconds)", bg="white", fg="black", font=("Arial", int(14 * SCALE))).pack(pady=(int(15 * SCALE), 0))
+        self.cycle_scale = ttk.Scale(left_frame, from_=1, to=30, orient="horizontal", length=int(300 * SCALE), command=self._on_cycle_scale)
+        self.cycle_scale.set(1)
+        self.cycle_scale.pack(pady=int(10 * SCALE))
+
+        self.cycle_ticks = tk.Canvas(left_frame, width=int(300 * SCALE), height=int(35 * SCALE), bg="white", highlightthickness=0)
+        self.cycle_ticks.pack(pady=(0, int(5 * SCALE)))
+        self._draw_ticks(self.cycle_ticks, 30, 5, int(300 * SCALE), timer=False)
+
+        self.cycle_value_label = tk.Label(left_frame, text="Cycles every 1s", bg="white", fg="black", font=("Arial", int(12 * SCALE)))
+        self.cycle_value_label.pack(pady=(0, int(10 * SCALE)))
+
+        # --- Buttons (Right Frame, moved up one slot) ---
+        self.start_btn = tk.Canvas(right_frame, width=int(100 * SCALE), height=int(100 * SCALE), bg="white", highlightthickness=0)
+        self.start_circle = self.start_btn.create_oval(10, 10, 90, 90, fill="#00AA00", outline="")
+        self.start_btn.pack(pady=(0, int(5 * SCALE)))
+        tk.Label(right_frame, text="Start", bg="white", font=("Arial", int(12 * SCALE), "bold")).pack()
+        self.start_btn.bind("<ButtonPress-1>", self._on_start_press)
+        self.start_btn.bind("<ButtonRelease-1>", self._on_start_release)
+
+        self.pause_btn = tk.Canvas(right_frame, width=int(100 * SCALE), height=int(100 * SCALE), bg="white", highlightthickness=0)
+        self.pause_circle = self.pause_btn.create_oval(10, 10, 90, 90, fill="#FFD700", outline="")
+        self.pause_btn.pack(pady=(0, int(5 * SCALE)))
+        tk.Label(right_frame, text="Pause", bg="white", font=("Arial", int(12 * SCALE), "bold")).pack()
+        self.pause_btn.bind("<ButtonPress-1>", self._on_pause_press)
+        self.pause_btn.bind("<ButtonRelease-1>", self._on_pause_release)
+
+        self.stop_btn = tk.Canvas(right_frame, width=int(100 * SCALE), height=int(100 * SCALE), bg="white", highlightthickness=0)
+        self.stop_circle = self.stop_btn.create_oval(10, 10, 90, 90, fill="#FF0000", outline="")
+        self.stop_btn.pack(pady=(0, int(5 * SCALE)))
+        tk.Label(right_frame, text="Stop", bg="white", font=("Arial", int(12 * SCALE), "bold")).pack()
+        self.stop_btn.bind("<ButtonPress-1>", self._on_stop_press)
+        self.stop_btn.bind("<ButtonRelease-1>", self._on_stop_release)
+
+    def _draw_ticks(self, canvas, max_val, step, width, timer=False):
+        canvas.delete("all")
+        ticks = list(range(1, max_val + 1, step))
+        if max_val not in ticks:
+            ticks.append(max_val)
+        n = len(ticks) - 1
+        for i, val in enumerate(ticks):
+            x = int((i / n) * width) if n > 0 else 0
+            canvas.create_line(x, 0, x, 10)
+            if timer:
+                mm, ss = divmod(val, 60)
+                lbl = f"{mm:02}:{ss:02}"
+            else:
+                lbl = str(val)
+            canvas.create_text(x, 25, text=lbl, font=("Arial", int(9 * SCALE)))
+
+    def _on_timer_scale(self, v):
+        self.total_time = int(float(v))
+        mm, ss = divmod(self.total_time, 60)
+        self.timer_value_label.config(text=f"Timer {mm:02}:{ss:02}")
+
+    def _on_cycle_scale(self, v):
+        self.cycle_rate = int(float(v))
+        self.cycle_value_label.config(text=f"Cycles every {self.cycle_rate}s")
+
+    def _on_start_press(self, event):
+        self.start_btn.itemconfig(self.start_circle, fill="#66ff66")
+
+    def _on_start_release(self, event):
+        self.start_btn.itemconfig(self.start_circle, fill="#00AA00")
+        self.start()
+
+    def _on_stop_press(self, event):
+        self.stop_btn.itemconfig(self.stop_circle, fill="#ff6666")
+
+    def _on_stop_release(self, event):
+        self.stop_btn.itemconfig(self.stop_circle, fill="#FF0000")
+        self.stop(reset=True)
+
+    def _on_pause_press(self, event):
+        self.pause_btn.itemconfig(self.pause_circle, fill="#ffe680")
+
+    def _on_pause_release(self, event):
+        self.pause_btn.itemconfig(self.pause_circle, fill="#FFD700")
+        self.pause()
+
+    def _update_ui_from_values(self):
+        mins, secs = divmod(self.elapsed, 60)
+        self.time_display.config(text=f"{mins:02}:{secs:02}")
+        self.count_display.config(text=str(self.cycle_count))
+        self.state_label.config(text=f"State: {self.state.upper()}")
+
+        if self.state == STATE_RUNNING:
+            self.timer_scale.config(state="disabled")
+            self.cycle_scale.config(state="disabled")
+        else:
+            self.timer_scale.config(state="normal")
+            self.cycle_scale.config(state="normal")
+
+        self.root.after(200, self._update_ui_from_values)
+
+    def start(self):
+        if self.state == STATE_RUNNING:
+            return
+        if self.state == STATE_SETUP and self.elapsed >= self.total_time:
+            self.elapsed = 0
+            self.cycle_count = 0
+        self.state = STATE_RUNNING
+        self._run_flag.set()
+        self._pause_flag.clear()
+        GPIO.output(LED_PIN, GPIO.HIGH)
+        if not (self._run_thread and self._run_thread.is_alive()):
+            self._run_thread = threading.Thread(target=self._run_loop, daemon=True)
+            self._run_thread.start()
+
+    def pause(self):
+        if self.state != STATE_RUNNING:
+            return
+        self.state = STATE_PAUSED
+        self._pause_flag.set()
+        GPIO.output(LED_PIN, GPIO.LOW)
+
+    def stop(self, reset=False):
+        self._run_flag.clear()
+        self._pause_flag.clear()
+        GPIO.output(LED_PIN, GPIO.LOW)
+        self.state = STATE_SETUP
+        if reset:
+            self.elapsed = 0
+            self.cycle_count = 0
+
+    def _run_loop(self):
+        last_tick = time.time()
+        while self._run_flag.is_set():
+            if self._pause_flag.is_set():
+                time.sleep(0.1)
+                last_tick = time.time()
+                continue
+            now = time.time()
+            if now - last_tick >= 1.0:
+                self.elapsed += 1
+                last_tick = now
+                if self.cycle_rate > 0 and self.elapsed % self.cycle_rate == 0:
+                    self.cycle_count += 1
+                if self.total_time > 0 and self.elapsed >= self.total_time:
+                    self.elapsed = self.total_time
+                    self._run_flag.clear()
+                    self.state = STATE_SETUP
+                    GPIO.output(LED_PIN, GPIO.LOW)
+                    break
+            time.sleep(0.05)
+
+    def _on_close(self):
+        self._run_flag.clear()
+        GPIO.output(LED_PIN, GPIO.LOW)
+        GPIO.cleanup()
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DeviceUI(root)
+    root.mainloop()
