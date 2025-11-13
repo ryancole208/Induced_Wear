@@ -1,45 +1,34 @@
 import tkinter as tk
 from tkinter import ttk
-import RPi.GPIO as GPIO
-import time
 import threading
+import time
+import RPi.GPIO as GPIO
 
-# --- Motor pins and PWM setup ---
-IN1 = 12
-IN2 = 13
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(IN1, GPIO.OUT)
-GPIO.setup(IN2, GPIO.OUT)
-pwm_in1 = GPIO.PWM(IN1, 1000)
-pwm_in2 = GPIO.PWM(IN2, 1000)
-pwm_in1.start(0)
-pwm_in2.start(0)
-
-# --- Motor timing configuration ---
+# --- Motor timing ---
 INITIAL_WAIT = 1
 MOTOR_DOWN_DURATION = 0.5
 MOTOR_UP_DURATION = 0.5
-MIN_CYCLE_RATE = int(INITIAL_WAIT + MOTOR_DOWN_DURATION + MOTOR_UP_DURATION + 1)  # = 3
+MIN_CYCLE_RATE = int(INITIAL_WAIT + MOTOR_DOWN_DURATION + MOTOR_UP_DURATION + 1)
 
-def spin_motor(direction, speed=80, duration=1):
-    if direction == 'forward':
-        pwm_in1.ChangeDutyCycle(speed)
-        pwm_in2.ChangeDutyCycle(0)
-    elif direction == 'backward':
-        pwm_in1.ChangeDutyCycle(0)
-        pwm_in2.ChangeDutyCycle(speed)
-    else:
-        pwm_in1.ChangeDutyCycle(0)
-        pwm_in2.ChangeDutyCycle(0)
-    time.sleep(duration)
-    pwm_in1.ChangeDutyCycle(0)
-    pwm_in2.ChangeDutyCycle(0)
-
-# --- UI States ---
 STATE_SETUP = "setup"
 STATE_RUNNING = "running"
 STATE_PAUSED = "paused"
 SCALE = 1.2
+
+# Pump & motor variables
+PUMP_RUN_TIME = 1.0  # seconds, changeable
+MOTOR_SPEED_UP = 80  # changeable
+MOTOR_SPEED_DOWN = 80  # changeable
+DEVICE_SWITCH_DELAY = 0.1  # seconds between device activations
+
+# --- GPIO pins (external buttons) ---
+STOP_PIN = 16
+GO_PIN = 1
+PAUSE_PIN = 14
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(STOP_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(GO_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(PAUSE_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 class DeviceUI:
     def __init__(self, root):
@@ -48,7 +37,11 @@ class DeviceUI:
         self.root.geometry("800x480+0+0")
         self.root.configure(bg="white")
 
-        self.total_seconds = 10 * 60  # default 10 minutes
+        # --- Initial slider values ---
+        self.total_seconds = 60       # 1 minute
+        self.chews = 2                # 2 chews
+        self.fluid_cycle = 10.0       # 10 seconds per cycle
+
         self.cycle_rate = float(MIN_CYCLE_RATE)
         self.elapsed = 0.0
         self.cycle_count = 0
@@ -66,6 +59,9 @@ class DeviceUI:
         self._update_ui_from_values()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Start thread to monitor external buttons
+        threading.Thread(target=self._external_buttons_loop, daemon=True).start()
+
     def _build_ui(self):
         top = tk.Frame(self.root, bg="white")
         top.pack(side="top", fill="x", pady=10)
@@ -74,9 +70,9 @@ class DeviceUI:
         right = tk.Frame(self.root, bg="white")
         right.pack(side="right", fill="both", expand=True)
 
-        # --- displays ---
+        # --- Info display ---
         tk.Label(top, text="Timer (hh:mm:ss):", bg="white", font=("Arial", 18, "bold")).grid(row=0, column=0, sticky="w", padx=20)
-        self.time_display = tk.Label(top, text="00:10:00", bg="white", font=("Arial", 24))
+        self.time_display = tk.Label(top, text="00:01:00", bg="white", font=("Arial", 24))
         self.time_display.grid(row=0, column=1, sticky="w")
 
         tk.Label(top, text="Cycles:", bg="white", font=("Arial", 18, "bold")).grid(row=1, column=0, sticky="w", padx=20)
@@ -88,8 +84,11 @@ class DeviceUI:
         self.motor_label = tk.Label(top, text="○ Idle", bg="white", fg="gray", font=("Arial", 14))
         self.motor_label.grid(row=2, column=1, sticky="w", padx=20)
 
+        self.hold_time_label = tk.Label(top, text="Hold time per chew: 0.0s", bg="white", font=("Arial", 12, "italic"), fg="gray")
+        self.hold_time_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=20)
+
         # --- Timer Slider ---
-        self.timer_value_label = tk.Label(left, text="Timer 00:10", bg="white", font=("Arial", 12))
+        self.timer_value_label = tk.Label(left, text="Timer 01:00", bg="white", font=("Arial", 12))
         self.timer_value_label.pack(pady=(0,10))
         tk.Label(left, text="Timer Duration (minutes)", bg="white", font=("Arial", 14)).pack()
         self.timer_scale = ttk.Scale(left, from_=0, to=720, orient="horizontal", length=300, command=self._on_timer_scale)
@@ -97,43 +96,23 @@ class DeviceUI:
         self.timer_scale.pack(pady=10)
         self._draw_timer_ticks(left)
 
-        # --- Cycle Slider ---
-        self.cycle_value_label = tk.Label(left, text=f"Cycles every {self.cycle_rate:.1f}s", bg="white", font=("Arial", 12))
-        self.cycle_value_label.pack(pady=(20,5))
-        tk.Label(left, text="Cycle Interval (seconds)", bg="white", font=("Arial", 14)).pack()
-        self.cycle_scale = ttk.Scale(left, from_=MIN_CYCLE_RATE, to=30, orient="horizontal", length=300, command=self._on_cycle_scale)
-        self.cycle_scale.set(self.cycle_rate)
-        self.cycle_scale.pack(pady=10)
+        # --- Chews Slider ---
+        self.chews_value_label = tk.Label(left, text=f"Chews: {self.chews}", bg="white", font=("Arial", 12))
+        self.chews_value_label.pack(pady=(20,5))
+        tk.Label(left, text="Number of Chews", bg="white", font=("Arial", 14)).pack()
+        self.chews_scale = ttk.Scale(left, from_=0, to=10, orient="horizontal", length=300, command=self._on_chews_scale)
+        self.chews_scale.set(self.chews)
+        self.chews_scale.pack(pady=10)
+        self._draw_chews_ticks(left)
 
-        self.hold_time_label = tk.Label(left, text=f"Hold Time: {self._calculate_hold_time(self.cycle_rate)}s", bg="white", font=("Arial", 12, "italic"), fg="gray")
-        self.hold_time_label.pack(pady=(5,10))
-
-        # --- Run Finished Log ---
-        self.log_label = tk.Label(right, text="", bg="white", fg="blue", font=("Arial", 12, "bold"))
-        self.log_label.place(relx=0.5, rely=0.05, anchor="center")
-
-        # --- Triangle Buttons ---
-        btn_size = int(100 * SCALE)
-        # Start top-center
-        self.start_btn = tk.Canvas(right, width=btn_size, height=btn_size, bg="white", highlightthickness=0)
-        self.start_circle = self.start_btn.create_oval(0,0,btn_size,btn_size, fill="#00AA00", outline="")
-        self.start_btn.place(relx=0.5, rely=0.15, anchor="center")
-        tk.Label(right, text="Start", bg="white", font=("Arial", 12, "bold")).place(relx=0.5, rely=0.32, anchor="center")
-        self.start_btn.bind("<ButtonRelease-1>", lambda e: self.start())
-
-        # Pause bottom-left
-        self.pause_btn = tk.Canvas(right, width=btn_size, height=btn_size, bg="white", highlightthickness=0)
-        self.pause_circle = self.pause_btn.create_oval(0,0,btn_size,btn_size, fill="#FFD700", outline="")
-        self.pause_btn.place(relx=0.25, rely=0.55, anchor="center")
-        tk.Label(right, text="Pause", bg="white", font=("Arial", 12, "bold")).place(relx=0.25, rely=0.72, anchor="center")
-        self.pause_btn.bind("<ButtonRelease-1>", lambda e: self.pause())
-
-        # Stop bottom-right
-        self.stop_btn = tk.Canvas(right, width=btn_size, height=btn_size, bg="white", highlightthickness=0)
-        self.stop_circle = self.stop_btn.create_oval(0,0,btn_size,btn_size, fill="#FF0000", outline="")
-        self.stop_btn.place(relx=0.75, rely=0.55, anchor="center")
-        tk.Label(right, text="Stop", bg="white", font=("Arial", 12, "bold")).place(relx=0.75, rely=0.72, anchor="center")
-        self.stop_btn.bind("<ButtonRelease-1>", lambda e: self.stop(True))
+        # --- Fluid Cycle Slider (lowered and spread apart) ---
+        self.fluid_value_label = tk.Label(right, text=f"Fluid Cycle: {self.fluid_cycle:.1f}s", bg="white", font=("Arial", 12))
+        self.fluid_value_label.place(relx=0.5, rely=0.08, anchor="center")
+        tk.Label(right, text="Fluid Cycle (s)", bg="white", font=("Arial", 14)).place(relx=0.5, rely=0.03, anchor="center")
+        self.fluid_scale = ttk.Scale(right, from_=self._calculate_min_fluid_cycle(), to=120, orient="horizontal", length=300, command=self._on_fluid_scale)
+        self.fluid_scale.set(self.fluid_cycle)
+        self.fluid_scale.place(relx=0.5, rely=0.13, anchor="center")
+        self._draw_fluid_ticks(right)
 
     def _draw_timer_ticks(self, frame):
         canvas = tk.Canvas(frame, width=300, height=35, bg="white", highlightthickness=0)
@@ -145,21 +124,53 @@ class DeviceUI:
             if hour % 2 == 0:
                 canvas.create_text(x, 25, text=f"{hour}:00", font=("Arial", 9))
 
-    def _calculate_hold_time(self, cycle_rate):
-        return max(round(cycle_rate - (INITIAL_WAIT + MOTOR_DOWN_DURATION + MOTOR_UP_DURATION), 2), 0)
+    def _draw_chews_ticks(self, frame):
+        canvas = tk.Canvas(frame, width=300, height=20, bg="white", highlightthickness=0)
+        canvas.pack()
+        for i in range(0, 11, 2):
+            x = (i / 10) * 300
+            canvas.create_line(x, 0, x, 10)
+            canvas.create_text(x, 15, text=f"{i}", font=("Arial", 9))
+
+    def _draw_fluid_ticks(self, frame):
+        canvas = tk.Canvas(frame, width=300, height=20, bg="white", highlightthickness=0)
+        canvas.place(relx=0.5, rely=0.18, anchor="center")
+        for i in range(int(self._calculate_min_fluid_cycle()), 121, 10):
+            x = ((i - int(self._calculate_min_fluid_cycle())) / (120 - int(self._calculate_min_fluid_cycle()))) * 300
+            canvas.create_line(x, 0, x, 10)
+            canvas.create_text(x, 15, text=f"{i}", font=("Arial", 9))
+
+    def _calculate_min_fluid_cycle(self):
+        return INITIAL_WAIT + PUMP_RUN_TIME*2 + MOTOR_DOWN_DURATION*10 + MOTOR_UP_DURATION*10 + 2
+
+    def _calculate_hold_time(self):
+        if self.chews <= 0:
+            return 0
+        available_time = self.fluid_cycle - INITIAL_WAIT - PUMP_RUN_TIME*2 - MOTOR_DOWN_DURATION - MOTOR_UP_DURATION
+        return max(round(available_time / (2 * self.chews), 2), 0)
 
     def _on_timer_scale(self, v):
+        if self.state != STATE_SETUP:
+            return
         minutes = int(float(v))
         self.total_seconds = minutes * 60
         h = self.total_seconds // 3600
         m = (self.total_seconds % 3600) // 60
         self.timer_value_label.config(text=f"Timer {h:02}:{m:02}")
 
-    def _on_cycle_scale(self, v):
-        val = max(MIN_CYCLE_RATE, float(v))
-        self.cycle_rate = val
-        self.cycle_value_label.config(text=f"Cycles every {self.cycle_rate:.1f}s")
-        self.hold_time_label.config(text=f"Hold Time: {self._calculate_hold_time(self.cycle_rate)}s")
+    def _on_chews_scale(self, v):
+        if self.state != STATE_SETUP:
+            return
+        self.chews = int(float(v))
+        self.chews_value_label.config(text=f"Chews: {self.chews}")
+        self.hold_time_label.config(text=f"Hold time per chew: {self._calculate_hold_time():.2f}s")
+
+    def _on_fluid_scale(self, v):
+        if self.state != STATE_SETUP:
+            return
+        self.fluid_cycle = int(float(v))  # integer seconds
+        self.fluid_value_label.config(text=f"Fluid Cycle: {self.fluid_cycle}s")
+        self.hold_time_label.config(text=f"Hold time per chew: {self._calculate_hold_time():.2f}s")
 
     def _update_ui_from_values(self):
         secs = int(self.elapsed)
@@ -169,21 +180,27 @@ class DeviceUI:
         self.time_display.config(text=f"{h:02}:{m:02}:{s:02}")
         self.count_display.config(text=str(self.cycle_count))
         self.state_label.config(text=f"State: {self.state.upper()}")
-
         if self.motor_active:
             self.motor_label.config(text="● Motor Active", fg="green")
         else:
             self.motor_label.config(text="○ Idle", fg="gray")
-
         self.root.after(200, self._update_ui_from_values)
 
+    def _external_buttons_loop(self):
+        while True:
+            if GPIO.input(STOP_PIN) == GPIO.LOW:
+                self.stop(True)
+            if GPIO.input(GO_PIN) == GPIO.LOW:
+                self.start()
+            if GPIO.input(PAUSE_PIN) == GPIO.LOW:
+                self.pause()
+            time.sleep(0.01)
+
     def start(self):
-        # If starting from SETUP, reset counters
         if self.state == STATE_SETUP:
             self.elapsed = 0
             self.cycle_count = 0
         self.state = STATE_RUNNING
-        self.log_label.config(text="")
         self._run_flag.set()
         self._pause_flag.clear()
         if not (self._run_thread and self._run_thread.is_alive()):
@@ -206,48 +223,66 @@ class DeviceUI:
 
     def _run_loop(self):
         start_time = time.time() - self.elapsed
-        next_cycle_time = time.time() + self.cycle_rate
-
+        last_cycle_time = 0
         while self._run_flag.is_set():
             if self._pause_flag.is_set():
                 time.sleep(0.1)
                 continue
-
             now = time.time()
             self.elapsed = now - start_time
 
-            if now >= next_cycle_time:
-                threading.Thread(target=self._motor_cycle, daemon=True).start()
-                self.cycle_count += 1
-                next_cycle_time += self.cycle_rate
+            # Count completed fluid cycles
+            completed_cycles = int(self.elapsed / self.fluid_cycle)
+            if completed_cycles > self.cycle_count:
+                self.cycle_count = completed_cycles
 
-            if self.total_seconds > 0 and self.elapsed >= self.total_seconds:
-                self.elapsed = self.total_seconds
-                self._run_flag.clear()
+            # Check timer end
+            if self.elapsed >= self.total_seconds:
                 self.state = STATE_SETUP
-                self.log_label.config(text="Run Finished")
-                break
+                self._run_flag.clear()
+
+            # --- Motor and Pump logic (commented out) ---
+            """
+            # INITIAL_WAIT
+            time.sleep(INITIAL_WAIT)
+
+            # Pump 1 run for PUMP_RUN_TIME
+            # GPIO.output(ENA, 1)
+            # GPIO.output(ENB, 1)
+            # Stepper sequence
+            # time.sleep(PUMP_RUN_TIME)
+            # GPIO.output(ENA, 0)
+            # GPIO.output(ENB, 0)
+            # time.sleep(PUMP_RUN_TIME)
+
+            # Chewing sequence
+            for chew in range(self.chews):
+                self.motor_active = True
+                # Motor down
+                # spin_motor('forward', speed=MOTOR_SPEED_DOWN, duration=MOTOR_DOWN_DURATION)
+                hold_time = self._calculate_hold_time()
+                time.sleep(hold_time)
+                # Motor up
+                # spin_motor('backward', speed=MOTOR_SPEED_UP, duration=MOTOR_UP_DURATION)
+                time.sleep(hold_time)
+                self.motor_active = False
+
+            # Pump 2 run for PUMP_RUN_TIME
+            # GPIO.output(ENA2, 1)
+            # GPIO.output(ENB2, 1)
+            # time.sleep(PUMP_RUN_TIME)
+            # GPIO.output(ENA2, 0)
+            # GPIO.output(ENB2, 0)
+            # time.sleep(PUMP_RUN_TIME)
+            """
 
             time.sleep(0.05)
-
-    def _motor_cycle(self):
-        time.sleep(INITIAL_WAIT)
-        self.motor_active = True
-        spin_motor("forward", duration=MOTOR_DOWN_DURATION)
-        hold_time = self._calculate_hold_time(self.cycle_rate)
-        if hold_time > 0:
-            time.sleep(hold_time)
-        spin_motor("backward", duration=MOTOR_UP_DURATION)
-        self.motor_active = False
 
     def _on_close(self):
         self._run_flag.clear()
         self._pause_flag.clear()
-        pwm_in1.stop()
-        pwm_in2.stop()
-        GPIO.cleanup()
+        # GPIO.cleanup()  # Uncomment when GPIOs are used
         self.root.destroy()
-
 
 if __name__ == "__main__":
     root = tk.Tk()
