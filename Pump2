@@ -1,0 +1,52 @@
+import RPi.GPIO as GPIO
+import time
+
+# GPIO assignments
+ENA = 8
+ENB = 11
+IN1 = 25
+IN2 = 24
+IN3 = 9
+IN4 = 10
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+for pin in [ENA, ENB, IN1, IN2, IN3, IN4]:
+    GPIO.setup(pin, GPIO.OUT)
+    GPIO.output(pin, 0)
+
+# Full-step sequence for bipolar stepper
+sequence = [
+    [1, 0, 1, 0],
+    [0, 1, 1, 0],
+    [0, 1, 0, 1],
+    [1, 0, 0, 1],
+]
+
+step_delay = 0.001  # adjust for speed/stability
+
+def run_motor_continuous():
+    GPIO.output(ENA, 1)
+    GPIO.output(ENB, 1)
+
+    try:
+        while True:
+            print('Pump Running')
+            for step in sequence:
+                GPIO.output(IN1, step[0])
+                GPIO.output(IN2, step[1])
+                GPIO.output(IN3, step[2])
+                GPIO.output(IN4, step[3])
+                time.sleep(step_delay)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        GPIO.output(ENA, 0)
+        GPIO.output(ENB, 0)
+        for pin in [IN1, IN2, IN3, IN4]:
+            GPIO.output(pin, 0)
+        GPIO.cleanup()
+
+if __name__ == "__main__":
+    run_motor_continuous()
