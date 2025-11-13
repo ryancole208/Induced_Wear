@@ -2,8 +2,8 @@ import RPi.GPIO as GPIO
 import time
 
 # GPIO assignments
-ENA = 5
-ENB = 6
+ENA = 18
+ENB = 15
 IN1 = 17
 IN2 = 27
 IN3 = 22
