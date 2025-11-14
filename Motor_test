@@ -2,54 +2,52 @@ import RPi.GPIO as GPIO
 import time
 
 # Pin configuration
-IN1 = 12  # Connect to IN1 on L298N
-IN2 = 13  # Connect to IN2 on L298N
-ENA = 16  # Connect to ENA on L298N (PWM speed control)
+IN1 = 12  # IN1 on L298N
+IN2 = 13  # IN2 on L298N
 
 # GPIO setup
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(IN1, GPIO.OUT)
 GPIO.setup(IN2, GPIO.OUT)
-GPIO.setup(ENA, GPIO.OUT)
 
-# Set up PWM on ENA at 1000Hz
-pwm = GPIO.PWM(ENA, 1000)
-pwm.start(0)  # Motor initially stopped
+# Set up PWM on IN1 and IN2 at 1000Hz
+pwm_in1 = GPIO.PWM(IN1, 1000)
+pwm_in2 = GPIO.PWM(IN2, 1000)
+pwm_in1.start(0)
+pwm_in2.start(0)
 
 def spin_motor(direction, speed=80, duration=2):
     """
-    Spins the motor in a given direction at a certain speed for a set duration.
+    Spins the motor in a given direction with PWM directly on IN1/IN2.
     direction: 'forward' or 'backward'
-    speed: 0-100 (percentage of max speed)
+    speed: 0-100 (% duty cycle)
     duration: seconds
     """
     if direction == 'forward':
-        GPIO.output(IN1, GPIO.HIGH)
-        GPIO.output(IN2, GPIO.LOW)
+        pwm_in1.ChangeDutyCycle(speed)
+        pwm_in2.ChangeDutyCycle(0)
     elif direction == 'backward':
-        GPIO.output(IN1, GPIO.LOW)
-        GPIO.output(IN2, GPIO.HIGH)
-    else:
-        GPIO.output(IN1, GPIO.LOW)
-        GPIO.output(IN2, GPIO.LOW)
-    
-    pwm.ChangeDutyCycle(speed)
+        pwm_in1.ChangeDutyCycle(0)
+        pwm_in2.ChangeDutyCycle(speed)
+    else:  # stop
+        pwm_in1.ChangeDutyCycle(0)
+        pwm_in2.ChangeDutyCycle(0)
+
     time.sleep(duration)
-    
-    # Stop the motor
-    GPIO.output(IN1, GPIO.LOW)
-    GPIO.output(IN2, GPIO.LOW)
-    pwm.ChangeDutyCycle(0)
+    # stop after duration
+    pwm_in1.ChangeDutyCycle(0)
+    pwm_in2.ChangeDutyCycle(0)
 
 try:
     print("Spinning forward")
     spin_motor('forward', speed=40, duration=1)
-    
-    time.sleep(1)  # Short pause
+
+    time.sleep(1)  # pause
 
     print("Spinning backward")
-    spin_motor('backward', speed=70, duration=2)
+    spin_motor('backward', speed=80, duration=1)
 
 finally:
-    pwm.stop()
+    pwm_in1.stop()
+    pwm_in2.stop()
     GPIO.cleanup()
