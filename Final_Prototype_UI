@@ -391,25 +391,24 @@ class DeviceUI:
         if self.state != STATE_SETUP:
             return
 
+        # Prevent callback firing before fluid_scale exists
+        if not hasattr(self, "fluid_scale"):
+            return
         self.chews = int(float(v))
         self.chews_value_label.config(text=f"Chews: {self.chews}")
 
-        # Update slider minimum based on new chew count
         new_min = self._calculate_min_fluid_cycle()
         self.fluid_scale.config(from_=new_min)
 
-        # Update fluid slider if it's below the new minimum
         if self.fluid_cycle < new_min:
             self.fluid_cycle = new_min
             self.fluid_scale.set(new_min)
             self.fluid_value_label.config(text=f"Fluid Cycle: {self.fluid_cycle:.1f}s")
 
-    # Update hold-time label (KEEP THIS)
         if hasattr(self, "hold_time_label"):
             self.hold_time_label.config(
                 text=f"Hold time per chew: {self._calculate_hold_time():.2f}s"
             )
-
 
     def _on_fluid_scale(self, v):
         if self.state != STATE_SETUP:
