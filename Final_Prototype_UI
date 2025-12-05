@@ -1,0 +1,933 @@
+import tkinter as tk
+from tkinter import ttk
+import threading
+import time
+import sys
+import RPi.GPIO as GPIO
+
+# -------------------------------------------------------------------
+# DPI / PREVIEW CONFIGURATION (for desktop preview of 800x480 Pi display)
+# -------------------------------------------------------------------
+TARGET_WIDTH = 800
+TARGET_HEIGHT = 480
+PI_DISPLAY_DPI = 96  # approximate DPI for the Pi 5" touchscreen
+
+def normalize_scaling(root):
+    try:
+        screen_dpi = root.winfo_fpixels("1i")
+        scale_factor = screen_dpi / PI_DISPLAY_DPI
+        root.tk.call('tk', 'scaling', scale_factor)
+    except Exception:
+        pass
+
+# -------------------------------------------------------------------
+# MOCK GPIO MODULE FOR DESKTOP TESTING
+# -------------------------------------------------------------------
+# Comment out (or remove) this mock block when you run on the Raspberry Pi.
+# class MockPWM:
+#     def __init__(self, pin, freq):
+#         self._d = 0
+#     def start(self, v):
+#         self._d = v
+#     def ChangeDutyCycle(self, v):
+#         self._d = v
+#     def stop(self):
+#         pass
+
+# class MockGPIO:
+#     BCM = 'BCM'
+#     OUT = 'OUT'
+#     IN = 'IN'
+#     LOW = 0
+#     HIGH = 1
+#     PUD_UP = 'PUD_UP'
+
+#     def setmode(self, mode):
+#         pass
+#     def setup(self, pin, mode, pull_up_down=None):
+#         pass
+#     def output(self, pin, value):
+#         pass
+#     def input(self, pin):
+#         return self.HIGH
+#     def cleanup(self):
+#         pass
+#     def PWM(self, pin, freq):
+#         return MockPWM(pin, freq)
+
+# GPIO = MockGPIO()
+# -------------------------------------------------------------------
+
+
+# --- Motor timing ---
+INITIAL_WAIT = 1
+MOTOR_DOWN_DURATION = 0.5
+MOTOR_UP_DURATION = 0.5
+MIN_CYCLE_RATE = int(INITIAL_WAIT + MOTOR_DOWN_DURATION + MOTOR_UP_DURATION + 1)
+
+# --- States ---
+STATE_SETUP = "setup"
+STATE_RUNNING = "running"
+STATE_PAUSED = "paused"
+STATE_STARTUP = "startup"         # new: Pump1 fill fluid
+STATE_DRAIN = "drain"             # new: Pump2 purge fluid
+STATE_REPLACE_SAMPLE = "replace"  # new: Replace sample (motor up)
+
+SCALE = 1.2
+
+# Pump & motor variables
+PUMP_RUN_TIME = 2.0
+MOTOR_SPEED_UP = 80
+MOTOR_SPEED_DOWN = 80
+DEVICE_SWITCH_DELAY = 0.1
+HOLD_PWM = 20
+
+# --- GPIO pins (external buttons) ---
+STOP_PIN = 16
+GO_PIN = 1
+PAUSE_PIN = 14
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(STOP_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(GO_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(PAUSE_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+# --- Pump 1 GPIO pins ---
+ENA = 18
+ENB = 15
+IN1 = 17
+IN2 = 27
+IN3 = 22
+IN4 = 23
+for pin in [ENA, ENB, IN1, IN2, IN3, IN4]:
+    GPIO.setup(pin, GPIO.OUT)
+    GPIO.output(pin, 0)
+
+# --- Pump 2 GPIO pins ---
+P2_ENA = 8
+P2_ENB = 11
+P2_IN1 = 25
+P2_IN2 = 24
+P2_IN3 = 9
+P2_IN4 = 10
+for pin in [P2_ENA, P2_ENB, P2_IN1, P2_IN2, P2_IN3, P2_IN4]:
+    GPIO.setup(pin, GPIO.OUT)
+    GPIO.output(pin, 0)
+
+# --- Motor GPIO pins using PWM ---
+MOTOR_IN1 = 12
+MOTOR_IN2 = 13
+GPIO.setup(MOTOR_IN1, GPIO.OUT)
+GPIO.setup(MOTOR_IN2, GPIO.OUT)
+pwm_in1 = GPIO.PWM(MOTOR_IN1, 1000)
+pwm_in2 = GPIO.PWM(MOTOR_IN2, 1000)
+pwm_in1.start(0)
+pwm_in2.start(0)
+
+#Defining Colors
+b_color = '#c6c6c6'
+f_color = '#007AFF'
+n_color = '#754100'
+
+class DeviceUI:
+    def __init__(self, root):
+        self.root = root
+
+        # DPI normalization so desktop preview matches Pi physical size
+        normalize_scaling(self.root)
+
+        # Force exact Pi geometry (no resizing)
+        self.root.title("Device UI")
+        self.root.geometry(f"{TARGET_WIDTH}x{TARGET_HEIGHT}+0+0")
+        self.root.minsize(TARGET_WIDTH, TARGET_HEIGHT)
+        self.root.maxsize(TARGET_WIDTH, TARGET_HEIGHT)
+        self.root.configure(bg=b_color)
+
+        # Core parameters
+        self.total_seconds = 60
+        self.chews = 2
+        self.fluid_cycle = 10.0
+
+        self.cycle_rate = float(MIN_CYCLE_RATE)
+        self.elapsed = 0.0
+        self.cycle_count = 0
+        self.state = STATE_SETUP
+        self.motor_active = False
+
+        # Flags and threading
+        self._run_flag = threading.Event()
+        self._pause_flag = threading.Event()
+        self._run_thread = None
+
+        # Locks / debounce
+        self._replace_lock = threading.Lock()   # prevents rapid toggles during motor move
+        self._buttons_lock = threading.Lock()   # serializes pump state updates
+
+        style = ttk.Style()
+        style.configure("TScale", sliderlength=int(30 * SCALE))
+
+        # Build UI
+        self._build_ui()
+        self._update_ui_from_values()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Start external buttons monitor
+        threading.Thread(target=self._external_buttons_loop, daemon=True).start()
+
+    # -------------------------
+    # UI build and layout
+    # -------------------------
+    def _build_ui(self):
+        # Top bar (Timer + Cycles display area)
+        top = tk.Frame(self.root, bg=b_color)
+        top.pack(side="top", fill="x", pady=(8, 2))
+
+        # Main split: left (Timer & Chews), right (Fluid cycle + controls)
+        container = tk.Frame(self.root, bg=b_color)
+        container.pack(side="top", fill="both", expand=True)
+
+        left = tk.Frame(container, bg=b_color, width=TARGET_WIDTH//2)
+        left.pack(side="left", fill="both", expand=True)
+        right = tk.Frame(container, bg=b_color, width=TARGET_WIDTH//2)
+        right.pack(side="right", fill="both", expand=True)
+
+        # --- Top labels area (Timer and Cycles readouts) centered in their frames ---
+        # Left top: Timer & Cycles readouts (centered in left frame)
+        left_top = tk.Frame(left, bg=b_color)
+        left_top.pack(side="top", fill="x", pady=(6, 6))
+
+        # Timer readout (value above label, centered)
+        tk.Label(left_top, text="Timer: (hh:mm:ss)", bg=b_color, fg = f_color, font=("Arial", 18, "bold")).pack(side="top")
+        self.time_display = tk.Label(left_top, text="00:01:00", bg=b_color, fg = n_color, font=("Arial", 24))
+        self.time_display.pack(side="top", pady=(0,2))
+        #tk.Label(left_top, text="Timer: (hh:mm:ss)", bg=b_color, font=("Arial", 18, "bold")).pack(side="top")
+
+        # Cycles readout (value above label, centered)
+        tk.Label(left_top, text="Cycles:", bg=b_color, fg = f_color, font=("Arial", 18, "bold")).pack(side="top")
+        self.count_display = tk.Label(left_top, text="0", bg=b_color, fg = n_color, font=("Arial", 24))
+        self.count_display.pack(side="top", pady=(10,2))
+        #tk.Label(left_top, text="Cycles:", bg=b_color, font=("Arial", 18, "bold")).pack(side="top")
+
+        # Right top: state and motor label (centered)
+        right_top = tk.Frame(right, bg=b_color)
+        right_top.pack(side="top", fill="x", pady=(6, 6))
+
+        self.state_label = tk.Label(right_top, text="State: SETUP", bg=b_color, fg="gray", font=("Arial", 14))
+        self.state_label.pack(side="top", pady=(0,2))
+        self.motor_label = tk.Label(right_top, text="○ Idle", bg=b_color, fg="gray", font=("Arial", 14))
+        self.motor_label.pack(side="top", pady=(0,2))
+
+        # --- Add the three large square toggle buttons (Setup, Purge, Replace Sample)
+        # placed inside the right frame, across the Timer/Cycles display, above the fluid slider
+        toggles_frame = tk.Frame(right, bg=b_color)
+        toggles_frame.pack(side="top", pady=(8, 2))
+
+        # We'll create vertical stacks: Label above square button, three columns
+        self.startup_var = tk.IntVar(value=0)
+        self.drain_var = tk.IntVar(value=0)
+        self.replace_var = tk.IntVar(value=0)
+
+        btn_font = ("Arial", 14, "bold")
+        label_font = ("Arial", 12)
+
+        # Helper to create a labeled square toggle
+        def create_labeled_toggle(parent, text, var, command):
+            frame = tk.Frame(parent, bg=b_color)
+            lbl = tk.Label(frame, text=text, bg=b_color, font=label_font, fg = f_color)
+            lbl.pack(side="top", pady=(0,4))
+            # Use Button as a large square toggle; text shows checkmark when active
+            btn = tk.Button(frame, text="", width=5, height=2, font=btn_font,
+                            relief="raised", bd=2,
+                            command=command)
+            btn.pack(side="top")
+            return frame, btn
+
+        # create toggles
+        startup_frame, self.startup_btn = create_labeled_toggle(toggles_frame, "Start Up", self.startup_var,
+                                                               lambda: self._toggle_startup())
+        drain_frame, self.drain_btn = create_labeled_toggle(toggles_frame, "Drain", self.drain_var,
+                                                            lambda: self._toggle_drain())
+        replace_frame, self.replace_btn = create_labeled_toggle(toggles_frame, "Replace Sample", self.replace_var,
+                                                                lambda: self._toggle_replace())
+
+        # Lay out three toggles horizontally, centered
+        startup_frame.pack(side="left", padx=12)
+        drain_frame.pack(side="left", padx=12)
+        replace_frame.pack(side="left", padx=12)
+
+        # --- Left column sliders (Timer and Chews) centered in left frame ---
+        left_controls = tk.Frame(left, bg=b_color)
+        left_controls.pack(side="top", pady=(6, 8))
+
+        # Timer slider: value (centered) above label above slider
+        self.timer_value_label = tk.Label(left_controls, text="Timer 01:00", bg=b_color, fg=f_color, font=("Arial", 12))
+        self.timer_value_label.pack(pady=(4,2))
+        tk.Label(left_controls, text="Timer Duration (hh:mm)", bg=b_color, fg=f_color, font=("Arial", 14)).pack()
+        self.timer_scale = ttk.Scale(left_controls, from_=0, to=720, orient="horizontal", length=300,
+                                     command=self._on_timer_scale)
+        self.timer_scale.set(self.total_seconds // 60)
+        self.timer_scale.pack(pady=(8,6))
+        self._draw_timer_ticks(left_controls)
+
+        # Chews slider: value above label above slider
+        self.chews_value_label = tk.Label(left_controls, text=f"Chews: {self.chews}", bg=b_color, fg=f_color, font=("Arial", 12))
+        self.chews_value_label.pack(pady=(12,2))
+        tk.Label(left_controls, text="Number of Chews", bg=b_color, fg=f_color, font=("Arial", 14)).pack()
+        self.chews_scale = ttk.Scale(left_controls, from_=0, to=10, orient="horizontal", length=300,
+                                     command=self._on_chews_scale)
+        self.chews_scale.set(self.chews)
+        self.chews_scale.pack(pady=(8,6))
+        self._draw_chews_ticks(left_controls)
+
+        # --- Right column: Fluid cycle controls ---
+        right_controls = tk.Frame(right, bg=b_color)
+        right_controls.pack(side="top", pady=(6, 12), fill="both", expand=True)
+
+        # Fluid value displayed ABOVE the label, centered (to match Timer and Chews)
+        self.fluid_value_label = tk.Label(right_controls, text=f"Fluid Cycle: {self.fluid_cycle:.1f}s",
+                                          bg=b_color, fg=f_color, font=("Arial", 12))
+        self.fluid_value_label.pack(pady=(8, 2))
+        tk.Label(right_controls, text="Fluid Cycle (s)", bg=b_color, fg=f_color, font=("Arial", 14)).pack()
+        # Place slider so it is visually parallel to the Timer slider (same length)
+        self.fluid_scale = ttk.Scale(right_controls, from_=self._calculate_min_fluid_cycle(), to=120,
+                                     orient="horizontal", length=300, command=self._on_fluid_scale)
+        self.fluid_scale.set(self.fluid_cycle)
+        self.fluid_scale.pack(pady=(8,6))
+        self._draw_fluid_ticks(right_controls)
+
+        # Save references to buttons so we can toggle appearance and disable/enable
+        self._all_toggle_buttons = {
+            'startup': self.startup_btn,
+            'drain': self.drain_btn,
+            'replace': self.replace_btn
+        }
+
+        # initialize button visuals
+        self._update_toggle_visuals()
+
+    # -------------------------
+    # helper draw ticks
+    # -------------------------
+    def _draw_timer_ticks(self, frame):
+        canvas = tk.Canvas(frame, width=300, height=35, bg=b_color, highlightthickness=0)
+        canvas.pack()
+        offset = 10
+        for hour in range(13):
+            x = offset + (hour / 12) * (300 - 2 * offset)
+            canvas.create_line(x, 0, x, 10)
+            if hour % 2 == 0:
+                canvas.create_text(x, 25, text=f"{hour}:00", font=("Arial", 9))
+
+    def _draw_chews_ticks(self, frame):
+        canvas = tk.Canvas(frame, width=300, height=20, bg=b_color, highlightthickness=0)
+        canvas.pack()
+        for i in range(0, 11, 2):
+            x = (i / 10) * 300
+            canvas.create_line(x, 0, x, 10)
+            canvas.create_text(x, 15, text=f"{i}", font=("Arial", 9))
+
+    def _draw_fluid_ticks(self, frame):
+        canvas = tk.Canvas(frame, width=300, height=20, bg=b_color, highlightthickness=0)
+        canvas.pack()
+        # Draw ticks from min to 120 every 10
+        start = int(self._calculate_min_fluid_cycle())
+        end = 120
+        rng = max(end - start, 1)
+        for i in range(start, end + 1, 10):
+            x = ((i - start) / rng) * 300
+            canvas.create_line(x, 0, x, 10)
+            canvas.create_text(x, 15, text=f"{i}", font=("Arial", 9))
+
+    # -------------------------
+    # calculations
+    # -------------------------
+    def _calculate_min_fluid_cycle(self):
+        MIN_HOLD = 0.5
+
+        if self.chews <= 0:
+            return INITIAL_WAIT + PUMP_RUN_TIME + PUMP_RUN_TIME
+        chew_block = self.chews * (
+            MOTOR_DOWN_DURATION + MOTOR_UP_DURATION + MIN_HOLD * 2
+        )
+
+        return INITIAL_WAIT + PUMP_RUN_TIME + chew_block + PUMP_RUN_TIME
+
+
+
+    def _calculate_hold_time(self):
+        if self.chews <= 0:
+            return 0
+
+        # Base time cost for a cycle (excluding hold time)
+        base = (
+            INITIAL_WAIT +
+            PUMP_RUN_TIME +
+            (self.chews * (MOTOR_DOWN_DURATION + MOTOR_UP_DURATION)) +
+            PUMP_RUN_TIME
+        )
+
+        available = self.fluid_cycle - base
+
+        # Each chew has 2 holds → total holds = chews * 2
+        if available <= 0:
+            return 0
+
+        return round(available / (2 * self.chews), 3)
+
+
+
+    # -------------------------
+    # slider callbacks
+    # -------------------------
+    def _on_timer_scale(self, v):
+        if self.state != STATE_SETUP:
+            return
+        minutes = int(float(v))
+        self.total_seconds = minutes * 60
+        h = self.total_seconds // 3600
+        m = (self.total_seconds % 3600) // 60
+        self.timer_value_label.config(text=f"Timer {h:02}:{m:02}")
+
+    def _on_chews_scale(self, v):
+        if self.state != STATE_SETUP:
+            return
+
+        self.chews = int(float(v))
+        self.chews_value_label.config(text=f"Chews: {self.chews}")
+
+        # Update slider minimum based on new chew count
+        new_min = self._calculate_min_fluid_cycle()
+        self.fluid_scale.config(from_=new_min)
+
+        # Update fluid slider if it's below the new minimum
+        if self.fluid_cycle < new_min:
+            self.fluid_cycle = new_min
+            self.fluid_scale.set(new_min)
+            self.fluid_value_label.config(text=f"Fluid Cycle: {self.fluid_cycle:.1f}s")
+
+    # Update hold-time label (KEEP THIS)
+        if hasattr(self, "hold_time_label"):
+            self.hold_time_label.config(
+                text=f"Hold time per chew: {self._calculate_hold_time():.2f}s"
+            )
+
+
+    def _on_fluid_scale(self, v):
+        if self.state != STATE_SETUP:
+            return
+        self.fluid_cycle = int(float(v))
+        self.fluid_value_label.config(text=f"Fluid Cycle: {self.fluid_cycle}s")
+        # update hold time display if that label exists
+        self.hold_time_label.config(text=f"Hold time per chew: {self._calculate_hold_time():.2f}s") if hasattr(self, "hold_time_label") else None
+
+    # -------------------------
+    # update UI periodic
+    # -------------------------
+    def _update_ui_from_values(self):
+        # update elapsed time here, not only in _run_loop
+        if self.state == STATE_RUNNING:
+            now = time.time()
+            self.elapsed = (now - self.base_start_time) - self.start_time_offset
+
+
+        secs = int(self.elapsed)
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        s = secs % 60
+        self.time_display.config(text=f"{h:02}:{m:02}:{s:02}")
+        self.count_display.config(text=str(self.cycle_count))
+        self.state_label.config(text=f"State: {self.state.upper()}")
+        self.motor_label.config(text="● Motor Active" if self.motor_active else "○ Idle",
+                                fg="green" if self.motor_active else "gray")
+        # Update toggle visuals in case external event changed them
+        self._update_toggle_visuals()
+        self.root.after(200, self._update_ui_from_values)
+
+    # -------------------------
+    # Toggle visuals helper
+    # -------------------------
+    def _update_toggle_visuals(self):
+        # Startup toggle
+        self._set_button_checked(self.startup_btn, bool(self.startup_var.get()))
+        self._set_button_checked(self.drain_btn, bool(self.drain_var.get()))
+        self._set_button_checked(self.replace_btn, bool(self.replace_var.get()))
+
+        # Buttons are only usable in SETUP state
+        disabled = (self.state != STATE_SETUP)
+        for btn in self._all_toggle_buttons.values():
+            btn.config(state="normal" if not disabled else "disabled")
+
+    def _set_button_checked(self, btn, checked):
+        if checked:
+            btn.config(text="✓", relief="sunken", bg="#d0ffd0")
+        else:
+            btn.config(text="", relief="raised", bg=b_color)
+
+    # -------------------------
+    # Toggle handlers (user pressed the large square toggles)
+    # All toggles only active in SETUP state
+    # -------------------------
+    def _toggle_startup(self):
+        # only allow toggle when in setup mode
+        if self.state != STATE_SETUP:
+            return
+        with self._buttons_lock:
+            new = 0 if self.startup_var.get() else 1
+            # ensure mutually exclusive with other special states
+            if new:
+                # entering startup: unset others
+                self.drain_var.set(0)
+                self.replace_var.set(0)
+                self._enter_startup_state()
+            else:
+                self._leave_special_state()
+            self.startup_var.set(new)
+            self._update_toggle_visuals()
+
+    def _toggle_drain(self):
+        if self.state != STATE_SETUP:
+            return
+        with self._buttons_lock:
+            new = 0 if self.drain_var.get() else 1
+            if new:
+                self.startup_var.set(0)
+                self.replace_var.set(0)
+                self._enter_drain_state()
+            else:
+                self._leave_special_state()
+            self.drain_var.set(new)
+            self._update_toggle_visuals()
+
+    def _toggle_replace(self):
+        if self.state != STATE_SETUP:
+            return
+        # prevent rapid toggles while motor is moving
+        if self._replace_lock.locked():
+            return
+        with self._buttons_lock:
+            new = 0 if self.replace_var.get() else 1
+            if new:
+                # entering replace sample
+                self.startup_var.set(0)
+                self.drain_var.set(0)
+                self._enter_replace_state()
+            else:
+                # user unchecked: move motor down then leave special state
+                self._leave_replace_state_triggered_by_uncheck()
+            self.replace_var.set(new)
+            self._update_toggle_visuals()
+
+    # -------------------------
+    # Enter / leave special states
+    # -------------------------
+    def _enter_startup_state(self):
+        # set state and start pump1 continuously
+        self.state = STATE_STARTUP
+        # Pump1 ON
+        GPIO.output(ENA, 1)
+        GPIO.output(ENB, 1)
+        # Pump stepping outputs (if used) left unchanged; on real hardware the motor driver would step
+        # Ensure motor holding PWM is cleared
+        threading.Thread(target=self._startup_pump1_loop, daemon=True).start()
+
+    def _startup_pump1_loop(self):
+        sequence = [[1,0,1,0], [0,1,1,0], [0,1,0,1], [1,0,0,1]]
+        step_index = 0
+        step_delay = 0.001
+
+        while self.state == STATE_STARTUP:
+            step = sequence[step_index]
+            GPIO.output(IN1, step[0])
+            GPIO.output(IN2, step[1])
+            GPIO.output(IN3, step[2])
+            GPIO.output(IN4, step[3])
+            step_index = (step_index + 1) % len(sequence)
+            time.sleep(step_delay)
+
+    # When leaving startup, shut down coils
+        for pin in [IN1, IN2, IN3, IN4]:
+            GPIO.output(pin, 0)
+
+    def _enter_drain_state(self):
+        self.state = STATE_DRAIN
+        GPIO.output(P2_ENA, 1)
+        GPIO.output(P2_ENB, 1)
+        threading.Thread(target=self._drain_pump2_loop, daemon=True).start()
+    def _drain_pump2_loop(self):
+        sequence = [[1,0,1,0], [0,1,1,0], [0,1,0,1], [1,0,0,1]]
+        step_index = 0
+        step_delay = 0.001
+        while self.state == STATE_DRAIN:
+            step = sequence[step_index]
+            GPIO.output(P2_IN1, step[0])
+            GPIO.output(P2_IN2, step[1])
+            GPIO.output(P2_IN3, step[2])
+            GPIO.output(P2_IN4, step[3])
+            step_index = (step_index + 1) % len(sequence)
+            time.sleep(step_delay)
+        for pin in [P2_IN1, P2_IN2, P2_IN3, P2_IN4]:
+            GPIO.output(pin, 0)
+
+    def _enter_replace_state(self):
+        def worker():
+            acquired = self._replace_lock.acquire(False)
+            if not acquired:
+                return
+            try:
+                self.state = STATE_REPLACE_SAMPLE
+                self.motor_active = True
+                pwm_in1.ChangeDutyCycle(0)
+                pwm_in2.ChangeDutyCycle(MOTOR_SPEED_UP)
+
+                t_end = time.time() + 1.0
+                while time.time() < t_end:
+                    # if external button changed state, abort early
+                    if self.state != STATE_REPLACE_SAMPLE:
+                        break
+                    time.sleep(0.05)
+
+                # Stop upward movement
+                pwm_in1.ChangeDutyCycle(0)
+                pwm_in2.ChangeDutyCycle(0)
+
+                # Apply HOLD torque only if Replace is still active
+                if self.replace_var.get() and self.state == STATE_REPLACE_SAMPLE:
+                    pwm_in2.ChangeDutyCycle(HOLD_PWM)
+
+                self.motor_active = False
+            finally:
+                if self._replace_lock.locked():
+                    self._replace_lock.release()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+
+    
+    def _leave_special_state(self):
+        # Called when a special toggle is unchecked or external button pressed
+        # Turn off pumps and return to SETUP
+        GPIO.output(ENA, 0)
+        GPIO.output(ENB, 0)
+        GPIO.output(P2_ENA, 0)
+        GPIO.output(P2_ENB, 0)
+        # Reset replace_var if it was active; if motor was in hold, we want to drop it to neutral
+        if self.replace_var.get():
+            # start motor down move to resting position (non-rapid)
+            self._leave_replace_state_triggered_by_uncheck()
+            self.replace_var.set(0)
+        self.state = STATE_SETUP
+        # Ensure PWMs are cleared
+        pwm_in1.ChangeDutyCycle(0)
+        pwm_in2.ChangeDutyCycle(0)
+
+    def _leave_replace_state_triggered_by_uncheck(self):
+        # Move motor down for 1 seconds when replace checkbox is unchecked.
+        # Non-interruptible movement; use lock to ignore rapid clicks and other motor requests during movement.
+        def worker_down():
+            # try to get lock and hold it through movement
+            got = self._replace_lock.acquire(False)
+            if not got:
+                # if currently moving up, wait briefly then attempt to acquire to do move-down
+                # but do not block UI indefinitely
+                waited = 0.0
+                while not self._replace_lock.acquire(False) and waited < 1.0:
+                    time.sleep(0.05)
+                    waited += 0.05
+                if not self._replace_lock.locked():
+                    # couldn't acquire in reasonable time; abort move-down to avoid deadlock
+                    return
+            try:
+                self.motor_active = True
+                pwm_in1.ChangeDutyCycle(MOTOR_SPEED_DOWN)
+                pwm_in2.ChangeDutyCycle(0)
+                t_end = time.time() + 1.0
+                while time.time() < t_end:
+                    time.sleep(0.05)
+                pwm_in1.ChangeDutyCycle(0)
+                pwm_in2.ChangeDutyCycle(0)
+                self.motor_active = False
+            finally:
+                if self._replace_lock.locked():
+                    self._replace_lock.release()
+                # After returning to resting, ensure state goes back to SETUP
+                self.state = STATE_SETUP
+
+        t = threading.Thread(target=worker_down, daemon=True)
+        t.start()
+
+    # -------------------------
+    # External buttons loop (monitors STOP/GO/PAUSE physical buttons)
+    # If any external button pressed, special states exit and system returns to SETUP
+    # -------------------------
+    def _external_buttons_loop(self):
+        while True:
+            try:
+                if GPIO.input(STOP_PIN) == GPIO.LOW:
+                    self._external_button_pressed()
+                    self.stop(True)
+                if GPIO.input(GO_PIN) == GPIO.LOW:
+                    # on GO we start main run loop if allowed
+                    #self._external_button_pressed()
+                    self.start()
+                if GPIO.input(PAUSE_PIN) == GPIO.LOW:
+                    #self._external_button_pressed()
+                    self.pause()
+            except Exception:
+                # ignore mocked GPIO exceptions on desktop
+                pass
+            time.sleep(0.05)
+
+    def _external_button_pressed(self):
+        # Always clear holding torque immediately
+        pwm_in1.ChangeDutyCycle(0)
+        pwm_in2.ChangeDutyCycle(0)
+
+        with self._buttons_lock:
+            # Tell any worker loops that we are no longer in special states
+            self.state = STATE_SETUP
+
+            self.startup_var.set(0)
+            self.drain_var.set(0)
+
+            if self.replace_var.get():
+                self.replace_var.set(0)
+                self._leave_replace_state_triggered_by_uncheck()
+
+            GPIO.output(ENA, 0)
+            GPIO.output(ENB, 0)
+            GPIO.output(P2_ENA, 0)
+            GPIO.output(P2_ENB, 0)
+
+            self._update_toggle_visuals()
+
+
+    # -------------------------
+    # Run control methods (unchanged but respect special states)
+    # -------------------------
+    #self.start_time_offset = 0
+    def pause(self):
+        if self.state != STATE_RUNNING:
+            return
+        self.pause_start = time.time()
+        self.state = STATE_PAUSED
+        self._pause_flag.set()
+
+    def start(self):
+        if self.state == STATE_PAUSED:
+            paused_duration = time.time() - self.pause_start
+            self.start_time_offset += paused_duration
+            self.state = STATE_RUNNING
+            self._pause_flag.clear()
+            return
+        if self.state == STATE_SETUP:
+            self.elapsed = 0
+            self.cycle_count = 0
+            self.start_time_offset = 0
+            self.pause_start = None
+        if self.state in [STATE_STARTUP, STATE_DRAIN, STATE_REPLACE_SAMPLE]:
+            return
+
+        self.state = STATE_RUNNING
+        self._run_flag.set()
+        self._pause_flag.clear()
+        if not (self._run_thread and self._run_thread.is_alive()):
+            self._run_thread = threading.Thread(target=self._run_loop, daemon=True)
+            self._run_thread.start()
+
+
+    def stop(self, reset=False):
+        self._run_flag.clear()
+        self._pause_flag.clear()
+        self.state = STATE_SETUP
+        # Stop motor hold PWM when going to setup
+        pwm_in1.ChangeDutyCycle(0)
+        pwm_in2.ChangeDutyCycle(0)
+        # turn off any pumps
+        GPIO.output(ENA, 0)
+        GPIO.output(ENB, 0)
+        GPIO.output(P2_ENA, 0)
+        GPIO.output(P2_ENB, 0)
+        if reset:
+            self.elapsed = 0
+            self.cycle_count = 0
+
+    # -------------------------
+    # Motor helper (used by main run loop). Replace-sample movement uses specialized methods above.
+    # -------------------------
+    def _spin_motor(self, direction, speed, duration, hold=False):
+        # Respect replace lock: if replace sample is doing a dedicated move, don't interfere
+        if self._replace_lock.locked():
+            return
+        self.motor_active = True
+        end_time = time.time() + duration
+
+        if direction == 'down':
+            pwm_in1.ChangeDutyCycle(speed)
+            pwm_in2.ChangeDutyCycle(0)
+            while time.time() < end_time and self._run_flag.is_set():
+                time.sleep(0.05)
+            pwm_in1.ChangeDutyCycle(0)
+            pwm_in2.ChangeDutyCycle(0)
+
+        elif direction == 'up':
+            pwm_in1.ChangeDutyCycle(0)
+            pwm_in2.ChangeDutyCycle(speed)
+            while time.time() < end_time and self._run_flag.is_set():
+                time.sleep(0.05)
+            # Maintain holding torque if requested
+            if hold and self.state in [STATE_RUNNING, STATE_PAUSED]:
+                pwm_in1.ChangeDutyCycle(0)
+                pwm_in2.ChangeDutyCycle(HOLD_PWM)
+            else:
+                pwm_in1.ChangeDutyCycle(0)
+                pwm_in2.ChangeDutyCycle(0)
+
+        self.motor_active = False
+
+    def _wait_or_pause(self, duration):
+        end_time = time.time() + duration
+        while time.time() < end_time and self._run_flag.is_set():
+            if self._pause_flag.is_set():
+                time.sleep(0.05)
+                continue
+        time.sleep(0.01)  # finer granularity
+    # -------------------------
+    # Main run loop (unchanged behavior)
+    # -------------------------
+    def _run_loop(self):
+        self.base_start_time = time.time()
+        self.start_time_offset = 0
+        #start_time = time.time() - self.elapsed
+
+        next_cycle_time = self.base_start_time
+        sequence = [[1,0,1,0],[0,1,1,0],[0,1,0,1],[1,0,0,1]]
+        rev_sequence = [[1,0,0,1],[0,1,0,1],[0,1,1,0],[1,0,1,0]]
+        step_delay = 0.001
+
+        while self._run_flag.is_set():
+            
+
+            now = time.time()
+            self.elapsed = (now - self.base_start_time) - self.start_time_offset
+
+            # Stop if elapsed time exceeds total_seconds
+            if self.elapsed >= self.total_seconds:
+                break
+
+            # Handle pause
+            if self._pause_flag.is_set():
+                time.sleep(0.05)
+                continue
+
+            if now >= next_cycle_time:
+                # --- INITIAL_WAIT ---
+
+                # wait_end = now + INITIAL_WAIT
+                # while time.time() < wait_end and self._run_flag.is_set():
+                #     time.sleep(0.05)
+                self._wait_or_pause(INITIAL_WAIT)
+
+                # --- Pump 1 ---
+                GPIO.output(ENA, 1)
+                GPIO.output(ENB, 1)
+                pump_end = time.time() + PUMP_RUN_TIME
+                step_index = 0
+                while time.time() < pump_end and self._run_flag.is_set():
+                    step = sequence[step_index]
+                    GPIO.output(IN1, step[0])
+                    GPIO.output(IN2, step[1])
+                    GPIO.output(IN3, step[2])
+                    GPIO.output(IN4, step[3])
+                    step_index = (step_index + 1) % len(sequence)
+                    time.sleep(step_delay)
+                GPIO.output(ENA, 0)
+                GPIO.output(ENB, 0)
+                for pin in [IN1, IN2, IN3, IN4]:
+                    GPIO.output(pin, 0)
+                
+                if self.chews == 0:
+                    time_used = INITIAL_WAIT + PUMP_RUN_TIME + PUMP_RUN_TIME
+                    idle_time = self.fluid_cycle - time_used
+
+                    if idle_time > 0:
+                        self._wait_or_pause(idle_time)
+                # Skip chewing loop
+
+                # --- Chewing sequence (motor down/up) ---
+                else:
+                    for chew in range(self.chews):
+                        self._spin_motor('down', MOTOR_SPEED_DOWN, MOTOR_DOWN_DURATION)
+                        hold_time = self._calculate_hold_time()
+                        hold_end = time.time() + hold_time
+                        while time.time() < hold_end and self._run_flag.is_set():
+                            time.sleep(0.05)
+
+                        self._spin_motor('up', MOTOR_SPEED_UP, MOTOR_UP_DURATION, hold=True)
+                        hold_end = time.time() + hold_time
+                        while time.time() < hold_end and self._run_flag.is_set():
+                            time.sleep(0.05)
+
+                # --- Pump 2 ---
+                GPIO.output(P2_ENA, 1)
+                GPIO.output(P2_ENB, 1)
+                pump_end = time.time() + PUMP_RUN_TIME
+                step_index = 0
+                while time.time() < pump_end and self._run_flag.is_set():
+                    step = sequence[step_index]
+                    GPIO.output(P2_IN1, step[0])
+                    GPIO.output(P2_IN2, step[1])
+                    GPIO.output(P2_IN3, step[2])
+                    GPIO.output(P2_IN4, step[3])
+                    step_index = (step_index + 1) % len(sequence)
+                    time.sleep(step_delay)
+                GPIO.output(P2_ENA, 0)
+                GPIO.output(P2_ENB, 0)
+                for pin in [P2_IN1, P2_IN2, P2_IN3, P2_IN4]:
+                    GPIO.output(pin, 0)
+
+                # --- Increment cycle count ---
+                self.cycle_count += 1
+
+                # --- Prepare for next cycle ---
+                next_cycle_time += self.fluid_cycle
+
+                # >>> NEW: STOP HERE IF PAUSED BEFORE NEXT CYCLE <<<
+
+                while self._pause_flag.is_set() and self._run_flag.is_set():
+
+                    # Ensure the motor is NOT holding during pause
+                    pwm_in1.ChangeDutyCycle(0)
+                    pwm_in2.ChangeDutyCycle(0)
+
+                    # Ensure pumps fully off
+                    GPIO.output(ENA, 0)
+                    GPIO.output(ENB, 0)
+                    GPIO.output(P2_ENA, 0)
+                    GPIO.output(P2_ENB, 0)
+                    time.sleep(0.05)
+
+
+            time.sleep(0.05)
+
+        # After finishing loop, stop safely
+        self._run_flag.clear()
+        self.state = STATE_SETUP
+        pwm_in1.ChangeDutyCycle(0)
+        pwm_in2.ChangeDutyCycle(0)
+
+    # -------------------------
+    # Close handler
+    # -------------------------
+    def _on_close(self):
+        self._run_flag.clear()
+        self._pause_flag.clear()
+        pwm_in1.stop()
+        pwm_in2.stop()
+        GPIO.cleanup()
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DeviceUI(root)
+    root.mainloop()
