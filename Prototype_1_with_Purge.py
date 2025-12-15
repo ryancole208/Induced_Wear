@@ -1,3 +1,4 @@
+#Prototype 1 code with purge function
 import RPi.GPIO as GPIO
 import time
 import board
