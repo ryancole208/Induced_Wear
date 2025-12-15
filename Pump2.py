@@ -1,3 +1,4 @@
+#Code for testing outflow pump. Relace GPIO pins for testing inlet pump
 import RPi.GPIO as GPIO
 import time
 
