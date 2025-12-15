@@ -1,3 +1,4 @@
+#Code for testing the chewing mechanism motor
 import RPi.GPIO as GPIO
 import time
 
