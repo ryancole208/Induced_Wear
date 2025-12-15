@@ -1,3 +1,4 @@
+#Run this with VSCode on a computer, not a Raspberry Pi
 import tkinter as tk
 from tkinter import ttk
 import threading
