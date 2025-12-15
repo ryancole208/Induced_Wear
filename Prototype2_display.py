@@ -1,3 +1,4 @@
+#Here is the code of just prototype 2 display
 import tkinter as tk
 from tkinter import ttk
 import threading
